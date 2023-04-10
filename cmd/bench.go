@@ -17,10 +17,13 @@
 package cmd
 
 import (
+	"bytes"
+	"context"
 	"fmt"
 	"math/rand"
 	"os"
 	"os/exec"
+	"path"
 	"path/filepath"
 	"runtime"
 	"strconv"
@@ -29,7 +32,13 @@ import (
 	"time"
 
 	"github.com/juicedata/juicefs/pkg/utils"
+	"github.com/minio/minio-go/v7"
+	"github.com/minio/minio-go/v7/pkg/credentials"
 	"github.com/urfave/cli/v2"
+)
+
+var (
+	minioClient *minio.Client
 )
 
 func cmdBench() *cli.Command {
@@ -116,45 +125,42 @@ type benchmark struct {
 func (bc *benchCase) writeFiles(index int) {
 	for i := 0; i < bc.fcount; i++ {
 		fname := fmt.Sprintf("%s/%s.%d.%d", bc.bm.tmpdir, bc.name, index, i)
-		fp, err := os.OpenFile(fname, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0644)
-		if err != nil {
-			logger.Fatalf("Failed to open file %s: %s", fname, err)
-		}
 		buf := make([]byte, bc.bsize)
 		_, _ = rand.Read(buf)
 		for j := 0; j < bc.bcount; j++ {
-			if _, err = fp.Write(buf); err != nil {
-				logger.Fatalf("Failed to write file %s: %s", fname, err)
-			}
+			minioClient.PutObject(context.Background(), "swift", fname, bytes.NewReader(buf), int64(len(buf)), minio.PutObjectOptions{})
 			bc.wbar.Increment()
 		}
-		_ = fp.Close()
 	}
 }
 
 func (bc *benchCase) readFiles(index int) {
 	for i := 0; i < bc.fcount; i++ {
 		fname := fmt.Sprintf("%s/%s.%d.%d", bc.bm.tmpdir, bc.name, index, i)
-		fp, err := os.Open(fname)
-		if err != nil {
-			logger.Fatalf("Failed to open file %s: %s", fname, err)
-		}
 		buf := make([]byte, bc.bsize)
 		for j := 0; j < bc.bcount; j++ {
-			if n, err := fp.Read(buf); err != nil || n != bc.bsize {
-				logger.Fatalf("Failed to read file %s: %d %s", fname, n, err)
+			reader, err := minioClient.GetObject(context.Background(), "swift", fname, minio.GetObjectOptions{})
+			if err != nil {
+				logger.Errorf("get object err:%v", err)
+				continue
 			}
+			n, _ := reader.Read(buf)
+			if n != bc.bsize {
+				logger.Error("read fail:%v %v", n, bc.bsize)
+			}
+			reader.Close()
 			bc.rbar.Increment()
 		}
-		_ = fp.Close()
 	}
 }
 
 func (bc *benchCase) statFiles(index int) {
 	for i := 0; i < bc.fcount; i++ {
 		fname := fmt.Sprintf("%s/%s.%d.%d", bc.bm.tmpdir, bc.name, index, i)
-		if _, err := os.Stat(fname); err != nil {
-			logger.Fatalf("Failed to stat file %s: %s", fname, err)
+		_, err := minioClient.StatObject(context.Background(), "swift", fname, minio.StatObjectOptions{})
+		if err != nil {
+			logger.Errorf("stat object err:%v", err)
+			continue
 		}
 		bc.sbar.Increment()
 	}
@@ -306,7 +312,25 @@ func printResult(result [][]string, leftAlign int, colorful bool) {
 	fmt.Println(divider)
 }
 
+func utilBenchObject(dir string) string {
+	return "bench" + dir
+}
+
+func utilBenchStatObject(dir string) string {
+	return "/tmp/bench" + path.Join(dir, ".stats")
+}
+
 func bench(ctx *cli.Context) error {
+	var errTmp error
+	minioClient, errTmp = minio.New("ai-juice-gateway.sf-express.com", &minio.Options{
+		Creds:  credentials.NewStaticV4("AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", ""),
+		Secure: false,
+		Region: "us-east-1",
+	})
+	if errTmp != nil {
+		logger.Fatalf("minio new fail:%v", errTmp)
+		return errTmp
+	}
 	setup(ctx, 1)
 	/* --- Pre-check --- */
 	if ctx.Uint("block-size") == 0 || ctx.Uint("threads") == 0 {
@@ -316,7 +340,8 @@ func bench(ctx *cli.Context) error {
 	if err != nil {
 		logger.Fatalf("Failed to get absolute path of %s: %s", ctx.Args().First(), err)
 	}
-	tmpdir = filepath.Join(tmpdir, fmt.Sprintf("__juicefs_benchmark_%d__", time.Now().UnixNano()))
+	tmpdir = filepath.Join(tmpdir, fmt.Sprintf("juicefs_benchmark_%d__", time.Now().UnixNano()))
+	tmpdir = utilBenchObject(tmpdir)
 	bm := newBenchmark(tmpdir, int(ctx.Uint("block-size")), int(ctx.Uint("big-file-size")),
 		int(ctx.Uint("small-file-size")), int(ctx.Uint("small-file-count")), int(ctx.Uint("threads")))
 	if bm.big == nil && bm.small == nil {
@@ -336,18 +361,7 @@ func bench(ctx *cli.Context) error {
 	}
 
 	/* --- Prepare --- */
-	if _, err := os.Stat(bm.tmpdir); os.IsNotExist(err) {
-		if err = os.MkdirAll(bm.tmpdir, 0755); err != nil {
-			logger.Fatalf("Failed to create %s: %s", bm.tmpdir, err)
-		}
-	}
 	var statsPath string
-	for mp := filepath.Dir(bm.tmpdir); mp != "/"; mp = filepath.Dir(mp) {
-		if _, err := os.Stat(filepath.Join(mp, ".stats")); err == nil {
-			statsPath = filepath.Join(mp, ".stats")
-			break
-		}
-	}
 	dropCaches := func() {
 		if os.Getenv("SKIP_DROP_CACHES") != "true" {
 			if err := exec.Command(purgeArgs[0], purgeArgs[1:]...).Run(); err != nil {
@@ -433,11 +447,6 @@ func bench(ctx *cli.Context) error {
 		result = append(result, line)
 	}
 	progress.Done()
-
-	/* --- Clean-up --- */
-	if err := exec.Command("rm", "-rf", bm.tmpdir).Run(); err != nil {
-		logger.Warnf("Failed to cleanup %s: %s", bm.tmpdir, err)
-	}
 
 	/* --- Report --- */
 	fmt.Println("Benchmark finished!")
