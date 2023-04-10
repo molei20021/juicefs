@@ -322,7 +322,7 @@ func utilBenchStatObject(dir string) string {
 
 func bench(ctx *cli.Context) error {
 	var errTmp error
-	minioClient, errTmp = minio.New("ai-juice-gateway.sf-express.com", &minio.Options{
+	minioClient, errTmp = minio.New(os.Getenv("JUICE_GATEWAY_ENDPOINT"), &minio.Options{
 		Creds:  credentials.NewStaticV4("AKIAIOSFODNN7EXAMPLE", "wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY", ""),
 		Secure: false,
 		Region: "us-east-1",
@@ -416,6 +416,7 @@ func bench(ctx *cli.Context) error {
 		line[2] += " s/file"
 		result = append(result, line)
 	}
+	time.Sleep(time.Second * 120)
 	if s := bm.small; s != nil {
 		cost := s.run("write")
 		s.wbar.Done()
